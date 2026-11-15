@@ -1,0 +1,180 @@
+name: Image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+concurrency:
+  group: image-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deny everything by default; jobs only get what they list.
+permissions: {}
+
+env:
+  IMAGE: notes-api:ci
+  # Pinned by digest (multi-arch index digests). Dependabot (docker ecosystem) can bump
+  # them if you move them into a Dockerfile/compose file; here they are bumped by hand.
+  POSTGRES_IMAGE: postgres:17-alpine@sha256:a77aa70e641402a21411b92b721c58d10f23b50ae5fdd2333efd22d166e1e5f7
+  ZAP_IMAGE: ghcr.io/zaproxy/zaproxy:stable@sha256:9624669db72f54d86c4b46a7064518bd9bf79d8c61a4c31befa9923489f328af
+
+jobs:
+  hadolint:
+    name: Dockerfile lint (Hadolint)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+  build-scan-dast:
+    name: Build, scan, DAST
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs: hadolint
+    permissions:
+      contents: read
+      security-events: write # upload Trivy SARIF
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build once. This exact image is scanned, run and attacked below.
+      - name: Build image (layer cache in GitHub Actions cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---- Image vulnerability scan -------------------------------------------------
+      # Pass 1: report everything to the Security tab, never fails the job.
+      - name: Trivy image scan (SARIF report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+
+      - name: Upload SARIF to the Security tab
+        if: ${{ !cancelled() }}
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-image
+
+      # Pass 2: the gate. Fails the job on HIGH/CRITICAL vulnerabilities.
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      # ---- SBOM (of the real image; attested later in release.yml) ------------------
+      - name: Generate SBOM (CycloneDX)
+        if: ${{ !cancelled() }}
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE }}
+          format: cyclonedx
+          output: sbom.cdx.json
+
+      - name: Upload SBOM
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom.cdx.json
+          retention-days: 30
+
+      # ---- Run the image for DAST ---------------------------------------------------
+      - name: Start Postgres and the app
+        run: |
+          set -euo pipefail
+          # Throw-away secrets for this run only, masked in logs.
+          SECRET_KEY="$(openssl rand -hex 32)"
+          DB_PASSWORD="$(openssl rand -hex 16)"
+          echo "::add-mask::${SECRET_KEY}"
+          echo "::add-mask::${DB_PASSWORD}"
+
+          docker network create ci-net
+
+          docker run -d --name db --network ci-net \
+            -e POSTGRES_USER=notes -e POSTGRES_PASSWORD="${DB_PASSWORD}" -e POSTGRES_DB=notes \
+            "${POSTGRES_IMAGE}"
+
+          for i in $(seq 1 30); do
+            docker exec db pg_isready -U notes -d notes && break
+            sleep 2
+          done
+          docker exec db pg_isready -U notes -d notes
+
+          docker run -d --name app --network ci-net -p 8000:8000 \
+            -e SECRET_KEY="${SECRET_KEY}" \
+            -e DATABASE_URL="postgresql://notes:${DB_PASSWORD}@db:5432/notes" \
+            "${IMAGE}"
+
+      - name: Wait for /health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/health; then echo; exit 0; fi
+            sleep 2
+          done
+          echo "app did not become healthy" >&2
+          docker logs app
+          exit 1
+
+      # ---- OWASP ZAP ----------------------------------------------------------------
+      # Baseline = passive only: spiders the app and inspects responses (headers, cookies...).
+      - name: ZAP baseline scan (passive)
+        uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: http://localhost:8000
+          docker_name: ${{ env.ZAP_IMAGE }}
+          fail_action: true
+          allow_issue_writing: false
+          artifact_name: zap-baseline-report
+
+      # API scan = reads openapi.yaml, then ACTIVELY attacks every operation (SQLi, XSS...).
+      # Only ever run this against your own throw-away container, as here.
+      - name: ZAP API scan (active, from openapi.yaml)
+        if: ${{ !cancelled() }}
+        uses: zaproxy/action-api-scan@5158fe4d9d8fcc75ea204db81317cce7f9e5453d # v0.10.0
+        with:
+          target: openapi.yaml
+          format: openapi
+          docker_name: ${{ env.ZAP_IMAGE }}
+          fail_action: true
+          allow_issue_writing: false
+          artifact_name: zap-api-report
+
+      - name: App logs
+        if: always()
+        run: docker logs app || true
+
+      - name: Cleanup
+        if: always()
+        run: docker rm -f app db || true
