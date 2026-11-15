@@ -2,7 +2,7 @@ Flask==2.2.2
 Werkzeug==2.2.2
 Jinja2==3.1.2
 itsdangerous==2.1.2
-requests==2.25.1
+requests==2.34.2
 gunicorn==20.1.0
 psycopg2-binary==2.9.10
 # gunicorn 20.1.0 imports pkg_resources, which slim Python images do not ship
